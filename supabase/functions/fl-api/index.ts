@@ -1,11 +1,12 @@
 // fl-api：LIFF 前端呼叫的 API（健康檢測、財務測驗、個人資料）
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
+import Anthropic from 'npm:@anthropic-ai/sdk';
 import { computeScores, FL_SCORE_ITEMS } from './score.ts';
 
 const FL_SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const FL_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const FL_LOGIN_CHANNEL_ID = Deno.env.get('FL_LOGIN_CHANNEL_ID') || ''; // 選填：限定 LIFF 所屬 channel
-const FL_AI_MODEL = 'gpt-4o-mini';
+const FL_AI_MODEL = 'claude-opus-5-5';
 const FL_ALLOWED_ORIGINS = ['https://ptgaminglife.github.io', 'http://localhost:8787'];
 const FL_MAX_IMAGE_CHARS = 1_500_000;
 
@@ -57,7 +58,7 @@ function flIsJpeg(v: unknown): v is string {
 }
 
 const FL_HEALTH_PROMPT = `你是外觀健康觀察助理，不做醫療診斷。根據兩張照片（臉部、舌部）給出 15 個觀察分數，
-每項為 1–10 的整數，10 代表最佳狀態（例如「浮腫」10 分＝完全不浮腫）。看不清楚的項目給 null。
+每項為 1–10 的整數，10 代表最佳狀態（例如「浮腫」10 分＝完全不浮腫）。看不清楚的項目給 0。
 不要計算總分。只輸出 JSON：
 {"face":[${FL_SCORE_ITEMS.face.join(',')}],"tongue":[${FL_SCORE_ITEMS.tongue.join(',')}],"eye":[${FL_SCORE_ITEMS.eye.join(',')}],
 "notes":{"face":"一句觀察","tongue":"一句觀察","eye":"一句觀察"},
@@ -66,36 +67,52 @@ const FL_HEALTH_PROMPT = `你是外觀健康觀察助理，不做醫療診斷。
 "urgent":false}
 陣列內依序填入上列項目的分數。若照片顯示可能需要緊急就醫的狀況，urgent 設為 true。`;
 
+const FL_INT_ARRAY = { type: 'array', items: { type: 'integer' } };
+const FL_HEALTH_SCHEMA = {
+  type: 'object',
+  properties: {
+    face: FL_INT_ARRAY, tongue: FL_INT_ARRAY, eye: FL_INT_ARRAY,
+    notes: {
+      type: 'object',
+      properties: { face: { type: 'string' }, tongue: { type: 'string' }, eye: { type: 'string' } },
+      required: ['face', 'tongue', 'eye'], additionalProperties: false,
+    },
+    summary: { type: 'string' },
+    tasks: { type: 'array', items: { type: 'string' } },
+    urgent: { type: 'boolean' },
+  },
+  required: ['face', 'tongue', 'eye', 'notes', 'summary', 'tasks', 'urgent'],
+  additionalProperties: false,
+};
+
 async function flHealth(req: Request, body: Record<string, unknown>, userId: string) {
   if (!flIsJpeg(body.face) || !flIsJpeg(body.tongue)) {
     return flJson(req, { error: 'FL_BAD_IMAGE', message: '照片格式不正確或檔案過大，請重新拍攝。' }, 400);
   }
-  const key = await flSecret('ai_api_key');
-  const ai = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: FL_AI_MODEL,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: FL_HEALTH_PROMPT },
-        { role: 'user', content: [
-          { type: 'text', text: '第一張是臉部，第二張是舌部。' },
-          { type: 'image_url', image_url: { url: body.face } },
-          { type: 'image_url', image_url: { url: body.tongue } },
-        ] },
-      ],
-    }),
-  });
-  if (!ai.ok) {
-    console.error('openai', ai.status, await ai.text());
-    return flJson(req, { error: 'FL_AI_FAILED', message: 'AI 分析暫時失敗，請稍後重試。' }, 502);
-  }
+  const client = new Anthropic({ apiKey: await flSecret('ai_api_key') });
   let raw: Record<string, unknown>;
   try {
-    raw = JSON.parse((await ai.json()).choices[0].message.content);
-  } catch {
-    return flJson(req, { error: 'FL_AI_JSON', message: 'AI 回傳格式異常，請重試。' }, 502);
+    const res = await client.beta.messages.create({
+      model: FL_AI_MODEL,
+      max_tokens: 16000,
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
+      output_config: { effort: 'medium', format: { type: 'json_schema', schema: FL_HEALTH_SCHEMA } },
+      system: FL_HEALTH_PROMPT,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: (body.face as string).split(',')[1] } },
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: (body.tongue as string).split(',')[1] } },
+        { type: 'text', text: '第一張是臉部，第二張是舌部。' },
+      ] }],
+    } as never) as Anthropic.Beta.BetaMessage;
+    if (res.stop_reason === 'refusal') {
+      return flJson(req, { error: 'FL_AI_REFUSED', message: '這組照片無法分析，請換一張清楚的照片重試。' }, 422);
+    }
+    const text = res.content.find((b) => b.type === 'text');
+    raw = JSON.parse(text && text.type === 'text' ? text.text : '');
+  } catch (e) {
+    console.error('anthropic', e instanceof Anthropic.APIError ? e.status : '', e instanceof Error ? e.message.slice(0, 200) : e);
+    return flJson(req, { error: 'FL_AI_FAILED', message: 'AI 分析暫時失敗，請稍後重試。' }, 502);
   }
   let result;
   try {

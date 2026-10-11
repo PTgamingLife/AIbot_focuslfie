@@ -1,4 +1,4 @@
-// fl-setup-richmenu：用 OpenAI 生成 4 格圖文選單底圖，建立並設為預設選單（管理用，需 admin token）
+// fl-setup-richmenu：上傳 4 格圖文選單底圖，建立並設為預設選單（管理用，需 admin token）
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
 
 const FL_SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
@@ -14,15 +14,6 @@ const FL_CELLS = [
   { label: '個人資訊填寫', p: 'profile', size: 'full' },
   { label: '聯絡專員', p: 'contact', size: 'compact' },
 ] as const;
-
-const FL_IMAGE_PROMPT = `LINE official account rich menu, flat modern UI, exactly 2x2 grid of four equal rounded tiles with thin gaps,
-color palette deep navy #1E3A5F background, teal #2EC4B6 accents, off-white #F7F9FB tiles.
-Each tile has one simple line icon centered above a large bold Traditional Chinese label, perfectly legible:
-top-left icon of a face with a heart pulse, label "健康檢測";
-top-right icon of a coin with a rising chart, label "財務健康度檢測";
-bottom-left icon of a profile card with a pen, label "個人資訊填寫";
-bottom-right icon of a chat bubble with a headset, label "聯絡專員".
-No other text, no watermark, high contrast, clean and professional.`;
 
 async function flSha256(v: string) {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v));
@@ -45,21 +36,14 @@ async function flLine(path: string, token: string, init: RequestInit = {}, host 
   return text ? JSON.parse(text) : {};
 }
 
-async function flGenerateImage(): Promise<Uint8Array> {
-  const key = await flSecret('ai_api_key');
-  const res = await fetch('https://api.openai.com/v1/images/generations', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-image-1', prompt: FL_IMAGE_PROMPT, size: `${FL_W}x${FL_H}`,
-      quality: 'medium', output_format: 'jpeg', output_compression: 80, n: 1,
-    }),
-  });
-  if (!res.ok) throw new Error(`OpenAI image ${res.status} ${await res.text()}`);
-  const b64 = (await res.json()).data[0].b64_json as string;
+// 選單圖由呼叫端提供（JPEG/PNG base64，≤1MB）
+function flDecodeImage(b64: unknown): { bytes: Uint8Array; type: string } {
+  if (typeof b64 !== 'string' || b64.length > 1_400_000) throw new Error('FL_BAD_IMAGE');
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  if (bytes.length > 1_000_000) throw new Error(`FL_IMAGE_TOO_LARGE:${bytes.length}`);
-  return bytes;
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8;
+  const isPng = bytes[0] === 0x89 && bytes[1] === 0x50;
+  if ((!isJpeg && !isPng) || bytes.length > 1_000_000) throw new Error('FL_BAD_IMAGE');
+  return { bytes, type: isJpeg ? 'image/jpeg' : 'image/png' };
 }
 
 Deno.serve(async (req) => {
@@ -77,7 +61,7 @@ Deno.serve(async (req) => {
     }
 
     const token = await flSecret('line_access_token');
-    const image = await flGenerateImage();
+    const image = flDecodeImage(body.imageBase64);
     const halfW = FL_W / 2;
     const halfH = FL_H / 2;
     const menu = await flLine('/v2/bot/richmenu', token, {
@@ -96,7 +80,7 @@ Deno.serve(async (req) => {
     });
     const richMenuId = menu.richMenuId as string;
     await flLine(`/v2/bot/richmenu/${richMenuId}/content`, token, {
-      method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: image,
+      method: 'POST', headers: { 'Content-Type': image.type }, body: image.bytes,
     }, 'api-data.line.me');
     await flLine(`/v2/bot/user/all/richmenu/${richMenuId}`, token, { method: 'POST' });
 
@@ -109,12 +93,13 @@ Deno.serve(async (req) => {
       { key: 'rich_menu_id', value: richMenuId, updated_at: new Date().toISOString() },
       { key: 'liff_ids', value: liff, updated_at: new Date().toISOString() },
     ]);
-    return new Response(JSON.stringify({ ok: true, richMenuId, imageBytes: image.length }), {
+    return new Response(JSON.stringify({ ok: true, richMenuId, imageBytes: image.bytes.length }), {
       headers: { 'Content-Type': 'application/json' },
     });
   } catch (e) {
     console.error(e);
-    return new Response(JSON.stringify({ ok: false, error: String(e instanceof Error ? e.message : e) }), {
+    const msg = e instanceof Error ? e.message : String(e);
+    return new Response(JSON.stringify({ ok: false, error: msg.startsWith('FL_') ? msg : msg.slice(0, 160) }), {
       status: 500, headers: { 'Content-Type': 'application/json' },
     });
   }

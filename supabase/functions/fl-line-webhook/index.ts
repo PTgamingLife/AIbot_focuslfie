@@ -1,13 +1,16 @@
 // fl-line-webhook：LINE Messaging API Webhook（驗簽 → 歡迎訊息 / AI 回覆 / 急症提示）
 import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
+import Anthropic from 'npm:@anthropic-ai/sdk';
 
 const FL_SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const FL_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-const FL_AI_MODEL = 'gpt-4o-mini';
+const FL_AI_MODEL = 'claude-opus-5-5';
 const FL_OA_NAME = 'AI專注訓練器';
 const FL_TONE = '溫暖、清楚、簡短；不做醫療診斷，遇到急症請使用者立即就醫。';
 const FL_URGENT_WORDS = ['胸痛', '胸悶', '呼吸困難', '喘不過氣', '昏倒', '意識不清', '中風', '大量出血', '想自殺', '自殺'];
 const FL_URGENT_REPLY = '你描述的狀況可能需要緊急處理，請立即撥打 119 或前往最近的急診，不要等待。若有自傷念頭，請撥 1925 安心專線。';
+
+const FL_SYSTEM = `你是 LINE 官方帳號「${FL_OA_NAME}」的助理，協助專注力、健康生活與個人財務規劃。語氣：${FL_TONE} 回覆 150 字內，使用繁體中文。不得做醫療診斷或保證投資報酬。可引導使用者點選下方選單的「健康檢測」「財務健康度檢測」「個人資訊填寫」「聯絡專員」。`;
 
 const flDb = createClient(FL_SUPABASE_URL, FL_SERVICE_KEY, { auth: { persistSession: false } });
 const flSecretCache: Record<string, string> = {};
@@ -43,23 +46,21 @@ async function flReply(replyToken: string, messages: unknown[]) {
 
 async function flAiReply(text: string): Promise<string> {
   try {
-    const key = await flSecret('ai_api_key');
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: FL_AI_MODEL,
-        max_tokens: 300,
-        messages: [
-          { role: 'system', content: `你是 LINE 官方帳號「${FL_OA_NAME}」的助理，協助專注力、健康生活與個人財務規劃。語氣：${FL_TONE} 回覆 150 字內，使用繁體中文。不得做醫療診斷或保證投資報酬。可引導使用者點選下方選單的「健康檢測」「財務健康度檢測」「個人資訊填寫」「聯絡專員」。` },
-          { role: 'user', content: text.slice(0, 1000) },
-        ],
-      }),
-    });
-    if (!res.ok) throw new Error(`openai ${res.status}`);
-    return (await res.json()).choices[0].message.content.trim();
+    const client = new Anthropic({ apiKey: await flSecret('ai_api_key') });
+    const res = await client.beta.messages.create({
+      model: FL_AI_MODEL,
+      max_tokens: 4000,
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
+      output_config: { effort: 'low' },
+      system: FL_SYSTEM,
+      messages: [{ role: 'user', content: text.slice(0, 1000) }],
+    } as never) as Anthropic.Beta.BetaMessage;
+    const out = res.stop_reason === 'refusal' ? null : res.content.find((b) => b.type === 'text');
+    if (!out || out.type !== 'text') throw new Error(`no text: ${res.stop_reason}`);
+    return out.text.trim();
   } catch (e) {
-    console.error(e);
+    console.error(e instanceof Error ? e.message.slice(0, 200) : e);
     return '收到你的訊息了！目前忙碌中，可以先點選下方選單使用各項功能。';
   }
 }
